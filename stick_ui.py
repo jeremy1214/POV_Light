@@ -1,10 +1,12 @@
 import sys
 import os
 import re
+import math
+import random
+import colorsys
 import time as time_module
-import argparse
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QRectF
 from PySide6.QtGui import QColor, QFont, QPainter, QBrush, QPen
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QPushButton, QLabel,
@@ -12,7 +14,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 
 from stick_control import Controller
 
+# ============================================================
 # 色彩主題設定
+# ============================================================
 BG = "#0d1117"
 SURFACE = "#161b22"
 TEXT = "#c9d1d9"
@@ -21,7 +25,7 @@ ACCENT = "#238636"
 DANGER = "#da3633"
 
 # ============================================================
-# 雙 IP 虛擬光棍 UI 元件
+# 雙 IP 虛擬光棍 UI 元件 (搭載 Python 虛擬特效引擎)
 # ============================================================
 class StickWidget(QWidget):
     def __init__(self, stick_id, ip1, ip2):
@@ -30,76 +34,136 @@ class StickWidget(QWidget):
         self.ip1 = ip1
         self.ip2 = ip2
         
-        # 雙主機連線狀態
         self.online1 = False
         self.online2 = False
         
-        self.color = (30, 30, 30) # 預設關機顏色
+        self.frame1 = None
+        self.frame2 = None
+        self.elapsed_ms = 0
+        
         self.setFixedSize(120, 340)
 
-    def update_state(self, online1, online2, color):
-        if (self.online1 != online1 or 
-            self.online2 != online2 or 
-            self.color != color):
-            self.online1 = online1
-            self.online2 = online2
-            # 只要其中一個 IP 上線，光棍就允許發光
-            self.color = color if (online1 or online2) else (30, 30, 30)
-            self.update()
+    def update_state(self, online1, online2, frame1, frame2, elapsed_ms):
+        self.online1 = online1
+        self.online2 = online2
+        self.frame1 = frame1
+        self.frame2 = frame2
+        self.elapsed_ms = elapsed_ms
+        self.update()
+
+    # ★ Python 版的 FastLED 渲染引擎 (模擬 30 顆 LED)
+    def render_leds(self, frame, ms, num_leds=30):
+        if not frame:
+            return [(40, 40, 45)] * num_leds
+            
+        t = frame.get("type", 0)
+        h = frame.get("h", 0)
+        s = frame.get("s", 0)
+        v = frame.get("v", 0)
+        spd = frame.get("spd", 128)
+        
+        leds = [(0, 0, 0)] * num_leds
+        
+        def hsv2rgb(h_8, s_8, v_8):
+            r, g, b = colorsys.hsv_to_rgb(h_8/255.0, s_8/255.0, v_8/255.0)
+            return (int(r*255), int(g*255), int(b*255))
+            
+        def beatsin8(bpm, low, high, time_ms):
+            if bpm == 0: return low
+            period = 60000.0 / bpm
+            phase = (time_ms % period) / period * 2 * math.pi
+            val = (math.sin(phase) + 1.0) / 2.0 
+            return int(low + val * (high - low))
+            
+        beat = beatsin8(spd / 4 + 20, 0, 255, ms)
+        
+        if t == 0: # Solid (長亮)
+            c = hsv2rgb(h, s, v)
+            leds = [c] * num_leds
+        elif t == 1: # Wave (波浪)
+            for i in range(num_leds):
+                hue = (h + (i * 8) + (ms * spd // 5)) % 256
+                leds[i] = hsv2rgb(hue, s, v)
+        elif t == 2: # Symmetry (對稱)
+            center = num_leds // 2
+            pos = (ms * spd // 20) % center
+            c = hsv2rgb(h, s, v)
+            leds[center + pos] = c
+            leds[center - 1 - pos] = c
+        elif t == 3: # Breathe (呼吸)
+            val = int(0 + (beat/255.0) * (v - 0))
+            c = hsv2rgb(h, s, val)
+            leds = [c] * num_leds
+        elif t == 4: # Tri-Color (三色)
+            for i in range(num_leds):
+                offset = (i + (ms * spd // 10)) % 3
+                if offset == 0: hue = h
+                elif offset == 1: hue = (h + 85) % 256
+                else: hue = (h + 170) % 256
+                leds[i] = hsv2rgb(hue, s, v)
+        elif t == 5: # Sparkle (閃爍)
+            for i in range(num_leds):
+                random.seed((ms // 50) + i * 100) # 每 50ms 重新隨機
+                if random.randint(0, 255) < (spd / 2):
+                    leds[i] = hsv2rgb(h, s, v)
+                    
+        return leds
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         
-        # 背景底板
         p.fillRect(self.rect(), QColor(SURFACE))
         
-        # 標題 (Stick 1, Stick 2...)
         p.setPen(QColor(TEXT if (self.online1 or self.online2) else DIM))
         f = QFont("Arial", 11, QFont.Bold)
         p.setFont(f)
         p.drawText(0, 10, self.width(), 20, Qt.AlignCenter, f"Stick {self.stick_id}")
         
-        # 雙 IP 狀態指示燈
         f.setPointSize(8)
         p.setFont(f)
-        
-        # 繪製 IP1 狀態
         c1 = ACCENT if self.online1 else DANGER
         p.setPen(QColor(c1))
         p.drawText(0, 30, self.width()//2, 20, Qt.AlignCenter, f".{self.ip1.split('.')[-1]}")
-        
-        # 繪製 IP2 狀態
         c2 = ACCENT if self.online2 else DANGER
         p.setPen(QColor(c2))
         p.drawText(self.width()//2, 30, self.width()//2, 20, Qt.AlignCenter, f".{self.ip2.split('.')[-1]}")
 
-        # 繪製發光的光棍本體 (圓角矩形)
         stick_width = 30
         stick_height = 250
         x = (self.width() - stick_width) // 2
         y = 65
         
-        if self.online1 or self.online2:
-            r, g, b = self.color
-            p.setBrush(QBrush(QColor(r, g, b)))
-            p.setPen(QPen(QColor(r, g, b).lighter(150), 2))
-        else:
-            p.setBrush(QBrush(QColor(40, 40, 45)))
-            p.setPen(QPen(QColor(60, 60, 65), 2))
+        # === 畫虛擬 LED 燈珠 ===
+        led_h = (stick_height / 2.0) / 30.0
+        
+        # IP1 (上半部，共 30 顆 LED)
+        leds1 = self.render_leds(self.frame1, self.elapsed_ms, 30) if self.online1 else [(40,40,45)]*30
+        for i, c in enumerate(reversed(leds1)):
+            p.fillRect(QRectF(x, y + i * led_h, stick_width, led_h), QColor(*c))
             
+        # IP2 (下半部，共 30 顆 LED)
+        y_bottom = y + stick_height / 2.0
+        leds2 = self.render_leds(self.frame2, self.elapsed_ms, 30) if self.online2 else [(40,40,45)]*30
+        for i, c in enumerate(reversed(leds2)):
+            p.fillRect(QRectF(x, y_bottom + i * led_h, stick_width, led_h), QColor(*c))
+
+        # 畫外框與中線
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(60, 60, 65), 2))
         p.drawRoundedRect(x, y, stick_width, stick_height, 15, 15)
+        p.drawLine(x, int(y + stick_height/2), x + stick_width, int(y + stick_height/2))
         p.end()
 
 # ============================================================
-# 主控台視窗
+# 主控台視窗 (MonitorWindow)
 # ============================================================
 class MonitorWindow(QMainWindow):
     def __init__(self, controller, sticks_map):
         super().__init__()
         self.controller = controller
-        self.sticks_map = sticks_map  # { stick_id: (ip1, ip2) }
-        self.stick_widgets = {}       # stick_id -> StickWidget
+        self.sticks_map = sticks_map  
+        self.stick_widgets = {}       
 
         self.setWindowTitle("Lightdance 智慧光棍控制中心")
         self.resize(900, 600)
@@ -126,7 +190,6 @@ class MonitorWindow(QMainWindow):
         self.scroll.setWidget(self.grid_container)
         root.addWidget(self.scroll, stretch=1)
 
-        # 初始化生成畫面上所有的實體光棍元件
         self._init_stick_widgets()
 
         # --- 播放控制區 ---
@@ -146,14 +209,11 @@ class MonitorWindow(QMainWindow):
         ctrl_layout.addWidget(self.btn_play)
         root.addLayout(ctrl_layout)
 
-        # --- 啟動背景服務 ---
         self.controller.setup_threads(self)
         self._setup_timers()
 
     def _init_stick_widgets(self):
-        """根據掃描結果，在畫面上依照順序排列光棍"""
-        col_count = 6 # 每排顯示 6 根
-        
+        col_count = 6 
         for idx, stick_id in enumerate(sorted(self.sticks_map.keys())):
             ip1, ip2 = self.sticks_map[stick_id]
             widget = StickWidget(stick_id, ip1, ip2)
@@ -192,7 +252,6 @@ class MonitorWindow(QMainWindow):
         else:
             self.lbl_time.setText("0.00 s")
 
-        # 針對每一根實體光棍，檢查它的兩個 IP 狀態
         for stick_id, widget in self.stick_widgets.items():
             ip1, ip2 = widget.ip1, widget.ip2
             
@@ -202,27 +261,19 @@ class MonitorWindow(QMainWindow):
             on1 = dev1 and dev1.last_response_time and (now - dev1.last_response_time < 2)
             on2 = dev2 and dev2.last_response_time and (now - dev2.last_response_time < 2)
             
-            color = (0, 0, 0)
-            # 只要有任何一端連線，就從該端提取顏色資料
-            if on1:
-                color = dev1.light_data.color_at(elapsed_ms)
-            elif on2:
-                color = dev2.light_data.color_at(elapsed_ms)
+            frame1 = None
+            frame2 = None
+            
+            if self.controller.isRunning:
+                if on1: frame1 = dev1.light_data.frame_at(elapsed_ms)
+                if on2: frame2 = dev2.light_data.frame_at(elapsed_ms)
                 
-            widget.update_state(on1, on2, color)
+            widget.update_state(on1, on2, frame1, frame2, elapsed_ms)
 
 # ============================================================
 # 🚀 開機自動掃描邏輯
 # ============================================================
 def auto_discover_sticks():
-    """
-    掃描目前資料夾，尋找 LightStick_192.168.1.xxx.json。
-    自動推算 Stick ID：
-    .101 & .102 -> Stick 1
-    .103 & .104 -> Stick 2
-    依此類推。
-    回傳：{ stick_id: (ip1, ip2) }
-    """
     sticks_map = {}
     
     for filename in os.listdir('.'):
@@ -230,14 +281,10 @@ def auto_discover_sticks():
         if match:
             last_octet = int(match.group(1))
             if last_octet >= 101:
-                # 數學推算：將 101/102 映射到 1，103/104 映射到 2
                 stick_id = (last_octet - 101) // 2 + 1
-                
-                # 計算出這根光棍該有的兩個 IP
                 base_octet = 101 + (stick_id - 1) * 2
                 ip1 = f"192.168.1.{base_octet}"
                 ip2 = f"192.168.1.{base_octet + 1}"
-                
                 sticks_map[stick_id] = (ip1, ip2)
                 
     return sticks_map
@@ -245,15 +292,11 @@ def auto_discover_sticks():
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # 1. 執行自動掃描
     sticks_map = auto_discover_sticks()
-    
-    # 2. 展開所有的 IP，餵給 Controller
     all_target_ips = []
     for ip1, ip2 in sticks_map.values():
         all_target_ips.extend([ip1, ip2])
 
-    # 3. 啟動系統
     controller = Controller(extra_ips=all_target_ips)
     window = MonitorWindow(controller, sticks_map)
     window.show()

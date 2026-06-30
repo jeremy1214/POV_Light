@@ -26,19 +26,20 @@ UDP_HEARTBEAT = 1751474546
 # ============================================================
 # JSON 光表解析器 (專為光棍設計)
 # ============================================================
+# ============================================================
+# JSON 光表解析器 (專為光棍設計)
+# ============================================================
 class StickData:
     def __init__(self, ip):
         self.ip = ip
         self.filename = f"LightStick_{self.ip}.json"
         self.frames = []
-        self.last_modified = 0 # 紀錄檔案最後修改時間
+        self.last_modified = 0 
         self.load_json()
 
     def check_for_updates(self):
-        """檢查 JSON 檔案是否有被外部編輯過，有的話就重新載入"""
         if not os.path.exists(self.filename):
             return
-            
         current_modified = os.path.getmtime(self.filename)
         if current_modified > self.last_modified:
             print(f"🔄 偵測到 {self.filename} 已更新，自動重新載入光表！")
@@ -48,9 +49,8 @@ class StickData:
     def load_json(self):
         if not os.path.exists(self.filename):
             return
-        
         try:
-            self.frames = [] # 清空舊資料
+            self.frames = []
             with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 show_data = data.get("2", [])
@@ -58,30 +58,28 @@ class StickData:
                 for item in show_data:
                     self.frames.append({
                         "start": acc_time,
+                        "type": item.get("type", 0), # 抓取特效種類
                         "h": item.get("hue", 0),
                         "s": item.get("sat", 0),
-                        "v": item.get("bri", 0)
+                        "v": item.get("bri", 0),
+                        "spd": item.get("spd", 128)  # 抓取特效速度
                     })
                     acc_time += item.get("dur", 0) * 1000
         except Exception as e:
             print(f"❌ 讀取 {self.filename} 失敗: {e}")
 
-    def color_at(self, elapsed_ms):
-        """根據經過的時間，回傳 RGB 顏色供 UI 預覽"""
-        self.check_for_updates() # ★ 每次抓顏色前，順便檢查檔案有沒有被修改
-        
+    # ★ 將原本的 color_at 改成 frame_at，回傳所有特效參數
+    def frame_at(self, elapsed_ms):
+        self.check_for_updates()
         if not self.frames:
-            return (0, 255, 255) if elapsed_ms > 0 else (0, 100, 100)
-
+            return None
         active = self.frames[0]
         for f in self.frames:
             if elapsed_ms >= f["start"]:
                 active = f
             else:
                 break
-        
-        r, g, b = colorsys.hsv_to_rgb(active["h"]/255.0, active["s"]/255.0, active["v"]/255.0)
-        return int(r*255), int(g*255), int(b*255)
+        return active
 
 # ============================================================
 # 裝置狀態
