@@ -39,8 +39,17 @@ constexpr uint8_t BRIGHTNESS = 90;
 constexpr uint8_t AS5600_ADDR   = 0x36;
 constexpr uint8_t RAW_ANGLE_REG = 0x0C;
 
-// 原本 D0 朝上時校正偏移量
+// 原本 D0 朝上時校正偏移量 (可透過 Serial 指令 'c' 動態校準)
 constexpr float ZERO_OFFSET_DEG = 51.86f;
+float runtimeZeroOffset = ZERO_OFFSET_DEG;
+
+// 動態自轉效果參數
+bool autoSpinEnabled = false;
+float dynamicSpinAngle = 0.0f;
+constexpr float SPIN_SPEED_DPS = 20.0f; // 動態自轉速度 (度/秒)
+
+// 動態亮度
+uint8_t currentBrightness = BRIGHTNESS;
 
 // ============================================================
 // 馬達安全控制 (Safety Motor Controller)
@@ -232,7 +241,7 @@ bool getRotorAngle(float &angle)
     }
 
     angle = (float)raw * (360.0f / 4096.0f);
-    angle -= ZERO_OFFSET_DEG;
+    angle -= runtimeZeroOffset;
     angle = wrapDeg(angle);
     return true;
 }
@@ -330,11 +339,24 @@ void renderPOV()
     }
     lastAngle = rotorAngle;
 
+    // 動態圖案自轉 (Dynamic Spin)
+    static uint32_t lastSpinUpdate = 0;
+    if (autoSpinEnabled) {
+        uint32_t now = micros();
+        if (lastSpinUpdate > 0) {
+            float dt = (float)(now - lastSpinUpdate) / 1000000.0f;
+            dynamicSpinAngle = wrapDeg(dynamicSpinAngle + SPIN_SPEED_DPS * dt);
+        }
+        lastSpinUpdate = now;
+    } else {
+        lastSpinUpdate = micros();
+    }
+
     // 葉片 2 (Blade 2, 相位 +90°)
-    int angle2 = (int)(rotorAngle + 90.0f + 0.5f) % 360;
+    int angle2 = (int)(rotorAngle + dynamicSpinAngle + 90.0f + 0.5f) % 360;
 
     // 葉片 4 (Blade 4, 相位 +270°)
-    int angle4 = (int)(rotorAngle + 270.0f + 0.5f) % 360;
+    int angle4 = (int)(rotorAngle + dynamicSpinAngle + 270.0f + 0.5f) % 360;
 
     // 填充兩葉片顏色 (Bitmask 高速取值)
     renderBlade(blade2, angle2);
@@ -344,6 +366,74 @@ void renderPOV()
     FastLED.show();
 
     frameCount++;
+}
+
+// ============================================================
+// 序列埠互動指令處理 (Serial Command Interface)
+// ============================================================
+
+void processSerialCommands()
+{
+    while (Serial.available() > 0) {
+        char cmd = (char)Serial.read();
+        if (cmd == '\r' || cmd == '\n') continue;
+
+        switch (cmd) {
+            case 'c':
+            case 'C': {
+                // 一鍵校準零點：將目前 AS5600 角度記錄為基準零點
+                uint16_t raw;
+                if (readRawAngle(raw)) {
+                    float currentDeg = (float)raw * (360.0f / 4096.0f);
+                    runtimeZeroOffset = currentDeg;
+                    Serial.println("\n--------------------------------------------------");
+                    Serial.printf("[CALIB] Success! Current Raw Angle = %.2f deg.\n", currentDeg);
+                    Serial.printf("[CALIB] Runtime zero offset updated to: %.2f deg.\n", runtimeZeroOffset);
+                    Serial.printf("[CALIB] To make permanent, update main.cpp:\n");
+                    Serial.printf("        constexpr float ZERO_OFFSET_DEG = %.2ff;\n", runtimeZeroOffset);
+                    Serial.println("--------------------------------------------------\n");
+                } else {
+                    Serial.println("[CALIB] Error: Failed to read AS5600 via I2C!");
+                }
+                break;
+            }
+            case 's':
+            case 'S': {
+                autoSpinEnabled = !autoSpinEnabled;
+                Serial.printf("[EFFECT] Auto-spin %s (Speed: %.1f deg/s)\n",
+                              autoSpinEnabled ? "ENABLED" : "DISABLED", SPIN_SPEED_DPS);
+                break;
+            }
+            case '+': {
+                if (currentBrightness <= 240) currentBrightness += 15;
+                else currentBrightness = 255;
+                FastLED.setBrightness(currentBrightness);
+                Serial.printf("[BRIGHTNESS] Increased to: %u / 255\n", currentBrightness);
+                break;
+            }
+            case '-': {
+                if (currentBrightness >= 25) currentBrightness -= 15;
+                else currentBrightness = 10;
+                FastLED.setBrightness(currentBrightness);
+                Serial.printf("[BRIGHTNESS] Decreased to: %u / 255\n", currentBrightness);
+                break;
+            }
+            case '?':
+            case 'h':
+            case 'H': {
+                Serial.println("\n--- [POV LIGHT CONTROL COMMANDS] ---");
+                Serial.println(" 'c' : Calibrate zero offset (align current angle as 0°)");
+                Serial.println(" 's' : Toggle dynamic pattern auto-spin");
+                Serial.println(" '+' : Increase LED brightness");
+                Serial.println(" '-' : Decrease LED brightness");
+                Serial.println(" '?' : Show this help menu");
+                Serial.println("------------------------------------\n");
+                break;
+            }
+            default:
+                break;
+        }
+    }
 }
 
 // ============================================================
@@ -390,6 +480,7 @@ void setup()
     FastLED.addLeds<WS2812B, PIN_B2, GRB>(blade2, NUM_LEDS);
     FastLED.addLeds<WS2812B, PIN_B4, GRB>(blade4, NUM_LEDS);
     FastLED.setBrightness(BRIGHTNESS);
+    FastLED.setMaxPowerInVoltsAndMilliamps(5, 1500); // 供電安全保護：上限 5V 1500mA 防止壓降重開機
 
     fill_solid(blade2, NUM_LEDS, CRGB::Black);
     fill_solid(blade4, NUM_LEDS, CRGB::Black);
@@ -420,6 +511,9 @@ void loop()
     // 2. 即時 POV 視覺暫留渲染 (全力高頻運行)
     renderPOV();
 
-    // 3. 系統即時監控數據回報 (每秒 1 次)
+    // 3. 處理序列埠互動指令 ('c' 校準, 's' 自轉, '+/-' 亮度)
+    processSerialCommands();
+
+    // 4. 系統即時監控數據回報 (每秒 1 次)
     updateDiagnostics();
 }
