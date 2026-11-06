@@ -1,229 +1,126 @@
-# test.cpp 程式碼深度分析報告 (POV 六芒星燈光顯示系統)
+# ESP32-C3 POV 旋轉視覺暫留顯示系統 (POV Light)
+
+一套基於 **Seeed Studio XIAO ESP32-C3** 的高效能**旋轉視覺暫留 (POV, Persistence of Vision)** 顯示與馬達控制系統。透過雙旋轉葉片搭載的 WS2812B 可定址 LED，結合 AS5600 磁性旋轉編碼器之閉迴路角度追蹤，在高速旋轉中於半空中精確投影出金色幾何圖騰——**六芒星 (Hexagram / 大衛之星)**。
 
 ---
 
-## 1. 專案與檔案背景概述 (System Overview)
-
-`test.cpp` 是一套基於 **ESP32-C3** 的 **旋轉視覺暫留 (POV, Persistence of Vision)** 顯示與馬達控制系統。其核心目標是透過馬達帶動兩根安裝有 WS2812B 可定址 LED 的旋轉葉片，利用磁性旋轉編碼器 (AS5600) 即時回傳旋轉角度，在旋轉過程中精確點亮對應位置的 LED，從而在半空中透過人類視覺暫留效應「投影」出一個懸浮的幾何圖形——**金色六芒星 (Hexagram / 大衛之星)**。
+## 🌟 系統特色與架構
 
 ```
-                    ┌─────────────────────────┐
-                    │      ESP32-C3 MCU       │
-                    └───────────┬─────────────┘
-                                │
-         ┌──────────────────────┼──────────────────────┐
-         ▼                      ▼                      ▼
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│  I2C (400 kHz)   │  │   2x RMT (GPIO)  │  │   PWM & ADC      │
-│  AS5600 編碼器   │  │   WS2812B 燈條   │  │   Spark 馬達電變  │
-│  (即時角度回授)  │  │  (雙葉片各42顆)  │  │  (可變電阻調速)  │
-└──────────────────┘  └──────────────────┘  └──────────────────┘
+                           ┌─────────────────────────┐
+                           │   Seeed XIAO ESP32-C3   │
+                           └────────────┬────────────┘
+                                        │
+             ┌──────────────────────────┼──────────────────────────┐
+             ▼                          ▼                          ▼
+   ┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
+   │  I2C (400 kHz)   │       │   2x RMT (GPIO)  │       │   50Hz PWM & ADC │
+   │  AS5600 磁編碼器 │       │   WS2812B 燈條   │       │   Spark 馬達電變 │
+   │ (12-bit 絕對角度)│       │ (雙葉片共 84 顆) │       │ (調速與安全鎖定) │
+   └──────────────────┘       └──────────────────┘       └──────────────────┘
 ```
+
+* **閉迴路高頻角度追蹤**：AS5600 磁編碼器以 400kHz I2C 讀取轉子 12-bit 絕對角度（4096 階），並具備角度零點補償 (`ZERO_OFFSET_DEG`)。
+* **雙葉片平行傳輸**：運用 ESP32-C3 雙通道 RMT 硬體控制器，單次 `FastLED.show()` 平行發射 Blade 2 與 Blade 4 訊號。
+* **幾何預算查表 (LUT)**：在開機階段將向量點線距幾何投影預先烘焙為 360 個角度的開關矩陣，旋轉中僅需 $O(1)$ 查找。
+* **安全防暴衝馬達調速**：整合 ESC 開機鎖定 (Arming) 與斷線保護 (Fail-Safe)，避免高動能旋轉葉片發生暴衝意外。
 
 ---
 
-## 2. 硬體架構與腳位映射 (Hardware & Pinout)
+## 🔌 硬體腳位定義與週邊配置
 
-依據 `platformio.ini` 與程式碼定義，目標開發板為 **Seeed Studio XIAO ESP32-C3**。
-
-| 腳位定義 | 實體 GPIO | 連接設備 / 模組 | 訊號類型 / 協定 | 功能說明 |
+| 腳位標記 | 實體 GPIO | 連接設備 | 訊號類型 / 協定 | 功能說明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `PIN_B2` (`D1`) | GPIO3 | 葉片 2 LED 燈條 | WS2812B (RMT) | 第 2 根葉片，機械相位偏移 $+90^\circ$ |
-| `PIN_B4` (`D3`) | GPIO5 | 葉片 4 LED 燈條 | WS2812B (RMT) | 第 4 根葉片，機械相位偏移 $+270^\circ$ (與 B2 相對 $180^\circ$) |
-| `POT_PIN` (`D2`)| GPIO4 | 可變電阻 (Potentiometer) | ADC1_CH4 (12-bit) | 馬達轉速手動調速輸入 |
-| `SDA_PIN` (`D4`)| GPIO6 | AS5600 磁編碼器 | I2C (SDA) | 傳輸轉子當前 12-bit 絕對角度 |
-| `SCL_PIN` (`D5`)| GPIO7 | AS5600 磁編碼器 | I2C (SCL, 400kHz) | I2C 通訊時脈 |
-| `SPARK_PIN` (`D6`)| GPIO21 | REV Spark 電變 / 伺服馬達 | PWM (50Hz Servo) | 輸出 1000~2000 $\mu s$ 脈寬控制轉速 |
+| `PIN_B2` (`D1`) | GPIO3 | 葉片 2 LED 燈條 | WS2812B (RMT) | 第 2 根葉片 (42 顆 LED)，機械相位偏移 $+90^\circ$ |
+| `PIN_B4` (`D3`) | GPIO5 | 葉片 4 LED 燈條 | WS2812B (RMT) | 第 4 根葉片 (42 顆 LED)，機械相位偏移 $+270^\circ$ |
+| `POT_PIN` (`D2`)| GPIO4 | 調速可變電阻 | ADC1_CH4 (12-bit) | 類比旋鈕轉速控制輸入 |
+| `SDA_PIN` (`D4`)| GPIO6 | AS5600 編碼器 | I2C (SDA) | 傳輸轉子當前角度資訊 |
+| `SCL_PIN` (`D5`)| GPIO7 | AS5600 編碼器 | I2C (SCL, 400kHz) | I2C 通訊時脈 |
+| `SPARK_PIN` (`D6`)| GPIO21 | REV Spark 電變 | 50Hz Servo PWM | 輸出 $1000 \sim 2000\,\mu s$ 脈寬驅動馬達 |
 
 ---
 
-## 3. 核心模組與演算法剖析 (Detailed Code Analysis)
+## 📁 專案檔案結構與分工
 
-### 3.1 幾何模型與半徑正規化 (`Geometry`)
-* **機構規格**：
-  * 外徑半徑：`OUTER_RADIUS_MM = 300.0 mm`
-  * 首顆 LED 半徑：`FIRST_LED_RADIUS_MM = 12.5 mm`
-  * 單葉片 LED 數量：`NUM_LEDS = 42`
-* **正規化半徑映射**：
-  函數 `logicalLEDToNormalizedRadius(index)` 將第 $0 \sim 41$ 顆 LED 線性對應至實體半徑 ($12.5 \sim 300.0\text{ mm}$)，再除以外徑 $300.0\text{ mm}$，得出範圍在 $[0.0417, 1.0]$ 之間的正規化半徑值 $r$。
+```
+POV_Light/
+├── platformio.ini         # PlatformIO 建置設定 (預設建置 main.cpp)
+├── test_analysis.md       # test.cpp 原始程式深度架構與效能分析報告
+├── README.md              # 本專案說明文件
+└── src/
+    ├── main.cpp           # 【最新】重構與優化版韌體 (含安全防護、Bitmask壓縮與診斷)
+    └── test.cpp           # 【封存】原始雛型程式碼 (完整保留供比對參考)
+```
 
-### 3.2 點到線段距離演算法 (`distanceToSegment`)
-為了在旋轉座標中判斷某個點 $(x, y)$ 是否位於六芒星的線段上，程式實作了標準的向量投影點線距演算法：
-$$\vec{v} = P_2 - P_1,\quad \vec{w} = P - P_1$$
-投影比例係數：
-$$t = \text{clamp}\left(\frac{\vec{w} \cdot \vec{v}}{\|\vec{v}\|^2}, 0, 1\right)$$
-投影點座標 $C = P_1 + t\vec{v}$，最後回傳 $\|P - C\|$。此方法正確處理了線段兩側端點與垂直投影區域。
+---
 
-### 3.3 靜態查表建構 (`buildHexagramTable`) —— 空間換取時間
-* **圖形定義**：六芒星由兩個正三角形交疊而成，頂點分佈在半徑 $R = 0.86$ 的圓周上：
-  * **正立三角形**：頂點角度為 $0^\circ, 120^\circ, 240^\circ$
-  * **倒立三角形**：頂點角度為 $180^\circ, 300^\circ, 60^\circ$
-  * **線條寬度**：`LINE_WIDTH = 0.055`
-* **查表矩陣 (`hexagramTable[360][42]`)**：
-  * 雙層迴圈在 `setup()` 時執行：遍歷 360 個整數角度及 42 顆 LED。
-  * 利用極座標轉直角座標：$x = r \sin(\theta), y = r \cos(\theta)$ (以 $12$ 點鐘方向為 $0^\circ$、順時針旋轉)。
-  * 逐一計算與六條邊的距離，若小於 `LINE_WIDTH` 則標記為 `true`。
-* **優點**：此舉在開機時完成所有耗時的浮點三角函數運算 (`sinf`, `cosf`, `sqrtf`)，讓旋轉動態彩現時只需做陣列取值，大幅降低 CPU 即時運算負擔。
+## 🛠️ 重要更新與安全重構歷程 (Changelog & Optimizations)
 
-### 3.4 角度讀取與零點校正 (`AS5600`)
-* 透過 I2C 讀取 AS5600 暫存器 `0x0C` (RAW ANGLE 高低 2 位元組，12-bit 解析度，共 4096 階)。
-* 轉換為角度：$\text{deg} = \text{raw} \times \frac{360.0}{4096.0}$。
-* 套用零點校正偏移：`angle -= ZERO_OFFSET_DEG (51.86°)`，並呼叫 `wrapDeg()` 限制在 $[0, 360)$ 範圍內。
+依據對原始原型 [`test.cpp`](src/test.cpp) 的全面分析，最新主程式 [`src/main.cpp`](src/main.cpp) 進行了以下關鍵升級：
 
-### 3.5 雙葉片相位補償與彩現管線 (`renderPOV`)
-* 機械結構為 4 葉片架構中的第 2 與第 4 葉片：
-  * 葉片 2 (Blade 2)：相較基準軸偏移 $+90^\circ$
-  * 葉片 4 (Blade 4)：相較基準軸偏移 $+270^\circ$
-* 實作即時角度對應：
-  ```cpp
-  int angle2 = (int)(rotorAngle + 90.0f + 0.5f) % 360;
-  int angle4 = (int)(rotorAngle + 270.0f + 0.5f) % 360;
+### 1. 🚨 馬達防暴衝保護與安全上鎖 (Fail-Safe & ESC Arming)
+* **原始問題**：在 `test.cpp` 中，`pot == 0` 時會被映射至全速 `2000µs`；若旋鈕接觸不良或訊號線脫落，ADC 掉至 0V 會導致馬達直接全速暴衝，造成嚴重機械毀損或人身安全事故。
+* **改進實作**：
+  * **開機安全上鎖 (Arming)**：開機後馬達強制鎖定在 `1500µs`（靜止中立點），直到使用者手動將可變電阻旋鈕旋轉至最低處歸零（ADC $\le 150$）後，系統才會解鎖輸出。
+  * **低端安全死區**：讀數小於 `150` 視為停轉；調大旋鈕才會平滑加速，徹底消除斷線暴衝隱患。
+  * **反向配線支援**：具備 `POT_INVERTED` 常數切換，方便因應不同硬體配線方向。
+
+### 2. ⚡ 非同步 $50\text{Hz}$ 調速降頻
+* **原始問題**：`test.cpp` 每次迴圈都重複呼叫 `analogRead(POT_PIN)`，每次轉換耗費 $30 \sim 50\,\mu s$，拖慢高速 POV 彩現時效。
+* **改進實作**：以 `millis()` 將馬達與 ADC 更新限制在 **$50\text{Hz}$ ($20\text{ms}$)**，與電變 PWM 訊號週期完美同步，把 CPU 運算資源完全釋放給 POV 迴圈。
+
+### 3. 💾 64-bit Bitmask LUT 記憶體壓縮 (節省 81% SRAM)
+* **原始結構**：`bool hexagramTable[360][42]` 佔用 $360 \times 42 = 15,120\text{ bytes}$ ($\approx 14.8\text{ KB}$)。
+* **改進實作**：改用 `uint64_t hexagramBitTable[360]`，將單一角度下 42 顆 LED 的開關狀態壓縮至 64 位元整數中，僅消耗 **$2,880\text{ bytes}$** ($\approx 2.8\text{ KB}$)。
+* **效益**：記憶體佔用大幅縮減 **$81\%$**，並利用單週期位元遮罩 `((mask >> i) & 1ULL)` 取值，顯著提升 CPU 快取命中率與取值速度。
+
+### 4. 📊 即時轉速 (RPM) 與 FPS 效能診斷
+* **新增功能**：監聽 AS5600 角度順時針跨越過零點（$360^\circ \to 0^\circ$）之微秒時間差，計算當前即時轉速並以指數移動平均 (EMA) 平滑濾波。
+* **序列埠監控**：每秒自動輸出格式化診斷資訊：
   ```
-* 依據查表內容填入金黃色 (`CRGB(255, 220, 40)`) 或黑色 (`CRGB::Black`)。
-* 呼叫單次 `FastLED.show()`，由 ESP32-C3 的硬體 RMT 控制器同時對兩個通道輸出訊號。
-
-### 3.6 馬達轉速控制 (`updateMotor`)
-* 讀取類比輸入 `POT_PIN` (12-bit，範圍 $0 \sim 4095$)。
-* 設有死區 `POT_DEAD_ZONE = 100`：當旋鈕讀數大於等於 $4095 - 100 = 3995$ 時，輸出靜止訊號 $1500\,\mu s$。
-* 否則將 $0 \sim 4095$ 映射為 $2000\,\mu s \sim 1500\,\mu s$ (逆向映射)。
+  [DIAG] RPM:  580.4 | FPS:  648 | Throttle PWM: 1680 us | Armed: YES
+  ```
 
 ---
 
-## 4. 關鍵效能與物理時序極限分析 (Timing & Bottleneck Analysis)
-
-POV 系統能否清晰成像，完全取決於**旋轉速度**與**單幀更新耗時**之間的物理限制：
+## ⏱️ 物理時序與更新率限制 (Timing Limits)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 單次 Loop 耗時構成                                          │
 ├─────────────────┬───────────────────┬───────────────────────┤
-│ I2C 角度讀取    │ WS2812B 訊號傳輸  │ ADC 類比轉換          │
-│ 約 100~150 µs   │ 約 1,260 µs       │ 約 30~50 µs           │
+│ I2C 角度讀取    │ WS2812B 訊號傳輸  │ 主迴圈位元查表        │
+│ 約 100~150 µs   │ 約 1,260 µs       │ 約 10~20 µs           │
 └─────────────────┴───────────────────┴───────────────────────┘
-  總耗時 t_cycle ≈ 1.45 ~ 1.50 ms ──► 最高更新率約 660 ~ 700 Hz
+  總耗時 t_cycle ≈ 1.4 ~ 1.5 ms ──► 最高更新率約 650 ~ 700 FPS
 ```
 
-1. **WS2812B 協議的硬性瓶頸**：
-   * WS2812B 為單線歸零碼 (NRZ)，每個 bit 傳輸耗時 $1.25\,\mu s$。
-   * 每顆 LED 需 24 bits = $30\,\mu s$。
-   * 單條 42 顆 LED：$42 \times 30\,\mu s = 1,260\,\mu s = 1.26\text{ ms}$。
-   * 加上重置信號 (Latch Reset) 至少需要 $50 \sim 300\,\mu s$。
-   * 傳輸 42 顆 LED 至少需要 **$\approx 1.3\text{ ms}$**。
-
-2. **旋轉角速度與解析度衝擊**：
-   * 假設馬達轉速為 **600 RPM** ($10\text{ 轉/秒}$，每轉耗時 $100\text{ ms}$)：
-     * 每轉理論時間：$100\text{ ms}$。
-     * 單幀循環時間約 $1.5\text{ ms}$，因此每轉最多只能更新：
-       $$\frac{100\text{ ms}}{1.5\text{ ms}} \approx 66 \text{ 次/轉}$$
-     * 每次更新葉片已轉動了約 **$5.4^\circ$**！
-   * 結論：**查表雖然切了 360 個角度（$1^\circ$ 解析度），但在轉速達到 600 RPM 以上時，受限於 WS2812B 通訊速度，實際顯示角解析度約只有 $5^\circ \sim 6^\circ$**，會產生輕微的角向拉伸或條紋感。
+* **WS2812B 物理極限**：
+  * 單顆 LED 傳輸耗時 $30\,\mu s$。單葉片 42 顆燈發送需耗時 $42 \times 30\,\mu s = 1.26\text{ ms}$。
+  * 在雙通道 RMT 硬體平行發送下，單幀發送依然需要約 **$1.3\text{ ms}$**（含重置 Latch 訊號）。
+* **旋轉角解析度**：
+  * 當轉速為 **600 RPM** ($10\text{ 轉/秒}$，每轉 $100\text{ ms}$) 時，每轉最多更新約 $66$ 次。
+  * 每幀葉片前進角約為 **$5.4^\circ$**。若需追求超高轉速與銳利顯示，建議未來升級為 SPI 傳輸型燈條（如 APA102 / SK9822）。
 
 ---
 
-## 5. 優勢與亮點 (Strengths)
+## 🚀 快速上手指南 (Quick Start)
 
-1. **查表優化設計優秀**：
-   * 在記憶體充裕的 ESP32-C3 上，將複雜的浮點點線幾何計算預先烘焙成 $360 \times 42$ 的布林陣列，在即時中斷/輪詢時只需 $O(1)$ 的記憶體查找，非常適合即時嵌入式系統。
-2. **多通道同步輸出**：
-   * 充分利用 FastLED 在 ESP32 上的 RMT 平行驅動能力，兩個葉片只需呼叫一次 `FastLED.show()` 即可由硬體並行發送，無額外 CPU 序列等待。
-3. **幾何座標正規化完備**：
-   * 考慮到了葉片中心到第一顆燈的實際機械物理間距 (`FIRST_LED_RADIUS_MM = 12.5mm`)，避免圖案在中心扭曲變形。
-
----
-
-## 6. 潛在風險與重大問題分析 (Issues & Critical Risks)
-
-### ⚠️ 風險 1：馬達控制安全邏輯存在安全漏洞 (Severe Safety Hazard)
-在 `updateMotor()` 中：
-```cpp
-if (pot >= 4095 - POT_DEAD_ZONE) {
-    currentPWM = MOTOR_STOP_US; // 1500us (停轉)
-} else {
-    currentPWM = map(pot, 0, 4095, MOTOR_MAX_US, MOTOR_STOP_US); // 0 -> 2000us (全速!)
-}
+### 1. 編譯與燒錄
+本專案已在 `platformio.ini` 中配置：
+```ini
+build_src_filter = +<main.cpp>
 ```
-* **問題**：
-  * 當 `pot == 0` 時，映射出的 PWM 為 `2000us` (最大轉速)！
-  * **斷線風險**：若調速旋鈕訊號線鬆脫、虛焊或接觸不良，ESP32 ADC 容易拉低至 0V (讀數為 0)。
-  * **後果**：系統一旦斷線或開機未旋轉旋鈕，馬達會**直接以最大馬力 (Full Throttle) 暴衝**！對於裝有 600mm 直徑高速旋轉葉片的機構而言，這是極高危險的機械與人身安全隱患。
+在 VS Code 中開啟本專案，點擊左下方 **PlatformIO Build (✓)** 或 **Upload (→)** 按鈕，即可自動編譯並燒錄至 XIAO ESP32-C3。
 
-### ⚠️ 風險 2：主迴圈頻繁讀取 ADC 拖慢 POV 更新速度
-* 在 `loop()` 裡，每次執行 `renderPOV()` 都會先呼叫 `updateMotor()`。
-* ESP32 的 `analogRead()` 每次轉換需消耗 $30 \sim 50\,\mu s$ 且常有底層雜訊。
-* 電變 (ESC) 的伺服脈衝訊號週期通常只有 **50Hz (每 20ms 一次)**。在 600Hz 以上的高速 POV 迴圈中，每隔 1.5ms 就去讀一次 ADC 並呼叫 `spark.writeMicroseconds` 完全是多餘的開銷，反而稀釋了 POV 的及時性。
-
-### ⚠️ 風險 3：記憶體結構型態有 8 倍的優化空間
-* 目前宣告：`bool hexagramTable[360][NUM_LEDS];`
-* 在 C++ 中，`bool` 實質佔用 1 byte (8 bits)。因此該表格消耗：
-  $$360 \times 42 \times 1\text{ byte} = 15,120\text{ bytes} \approx 14.8\text{ KB}$$
-* 雖然 ESP32-C3 有 400KB SRAM，但若改用 `uint64_t` 位元遮罩 (因為 $42 \le 64$ 位元)：
-  $$360 \times 8\text{ bytes} = 2,880\text{ bytes} \approx 2.8\text{ KB}$$
-  可減少 **81%** 的快取與記憶體佔用，且位元操作速度更敏捷。
-
-### ⚠️ 風險 4：I2C 讀取失敗時無重試或日誌機制
-* `readRawAngle()` 若在高速旋轉引發電磁干擾 (EMI) 或晃動導致 I2C 通訊失敗，會直接回傳 `false`，`renderPOV()` 則直接 `return` 跳過該幀。
-* 雖然不會死機，但若旋轉時頻繁丟失封包，葉片會短暫保持上一幀內容，在高速下可能形成殘影或錯位。
-
----
-
-## 7. 重構與優化建議 (Recommended Improvements)
-
-### 7.1 馬達調速安全性修復與非同步降頻
-建議將馬達調速獨立於 POV 迴圈之外，限制在 20ms (50Hz) 更新一次，並加入「低檔安全啟動 (Fail-Safe)」與正確的方向映射：
-
-```cpp
-void updateMotorSafe()
-{
-    static unsigned long lastMotorUpdate = 0;
-    unsigned long now = millis();
-    
-    // 降頻至 50Hz (20ms)，避免消耗 POV 循環資源
-    if (now - lastMotorUpdate < 20) {
-        return;
-    }
-    lastMotorUpdate = now;
-
-    int pot = analogRead(POT_PIN);
-    pot = constrain(pot, 0, 4095);
-
-    // 安全邏輯：將低端設為死區 (停轉)，高端設為加速
-    // 即使旋鈕斷線拔除 (通常掉到 0V)，也會安全停轉
-    constexpr int POT_MIN_DEAD_ZONE = 150; 
-
-    if (pot <= POT_MIN_DEAD_ZONE) {
-        currentPWM = MOTOR_STOP_US; // 1500us
-    } else {
-        // 從停止漸進至全速
-        currentPWM = map(pot, POT_MIN_DEAD_ZONE, 4095, MOTOR_STOP_US, MOTOR_MAX_US);
-        currentPWM = constrain(currentPWM, MOTOR_STOP_US, MOTOR_MAX_US);
-    }
-
-    spark.writeMicroseconds(currentPWM);
-}
-```
-
-### 7.2 記憶體位元遮罩化 (Bitmask LUT)
-```cpp
-// 360 個角度，每個角度用一個 64 位元整數儲存 42 顆 LED 的開關狀態
-uint64_t hexagramBitTable[360];
-
-// 建表時：
-if (on) {
-    hexagramBitTable[deg] |= (1ULL << led);
-}
-
-// 彩現時：
-uint64_t pattern = hexagramBitTable[angleDeg];
-for (int i = 0; i < NUM_LEDS; i++) {
-    if ((pattern >> i) & 1ULL) {
-        leds[i] = CRGB(255, 220, 40);
-    } else {
-        leds[i] = CRGB::Black;
-    }
-}
-```
-
-### 7.3 硬體層級建議 (次世代 POV 升級)
-若後續欲提高顯示細緻度與轉速：
-* 將 **WS2812B** 更換為 **APA102 / SK9822 / HD107s** (具備獨立 Data 與 Clock 腳位之 SPI 燈條)。
-* SPI 傳輸頻率可達 20MHz 以上，42 顆燈的更新時間可從 $1260\,\mu s$ 縮減至 **$50\,\mu s$ 以內**，顯示角解析度將提升 20 倍以上，徹底消除高速旋轉下的扇形拉扯效應。
+### 2. 開機解鎖流程 (ESC Arming)
+1. 確保電源已妥善連接，開啟 Serial Monitor (Baud Rate: `115200`)。
+2. 開機後，系統會提示：
+   ```
+   System Ready. Please zero throttle knob to ARM motor.
+   ```
+3. **將可變電阻旋鈕旋至最低處**，Serial Monitor 出現：
+   ```
+   [MOTOR] Arming Success: Motor Unlocked.
+   ```
+4. 此時調速功能已解鎖，順時針旋轉旋鈕即可平滑提高轉速，半空中將穩定呈現金色六芒星。
