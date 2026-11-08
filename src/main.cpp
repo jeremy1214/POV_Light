@@ -91,11 +91,11 @@ constexpr float OUTER_RADIUS_MM     = 300.0f;
 constexpr float FIRST_LED_RADIUS_MM = 12.5f;
 
 // ============================================================
-// 十字圖案查表 (Cross Bitmask LUT: 360 角度 × uint64_t)
+// 十字圖案查表 (720 角度切片 × uint64_t，0.5° 超高角解析度)
 //
-// 支援兩種經典十字樣式：
-// 1. CROSS_GREEK : 正十字 (四臂等長對稱，交叉於圓心)
-// 2. CROSS_LATIN : 拉丁十字架 (橫樑偏上方，經典十字架)
+// 提升流暢度關鍵改進：
+// 1. 由 360 階升級為 720 階 (每階 0.5°)，角度量化間距縮小 50%，消除階梯鋸齒
+// 2. 佔用 720 * 8 bytes = 5,760 bytes (僅 5.6 KB)，極速 64-bit Bitmask 取值
 // ============================================================
 
 enum CrossType {
@@ -105,7 +105,11 @@ enum CrossType {
 
 CrossType currentCrossType = CROSS_GREEK; // 預設正十字
 
-uint64_t crossBitTable[360];
+constexpr uint16_t NUM_ANGLES = 720; // 720 個角度切片 (0.5°/階)
+uint64_t crossBitTable[NUM_ANGLES];
+
+// 雙葉片微相位校準 (Micro Phase Trim)：補償機械安裝誤差，消除雙重疊影與毛邊
+float blade4TrimDeg = 0.0f;
 
 // ============================================================
 // 系統運作診斷數據
@@ -131,7 +135,7 @@ inline float wrapDeg(float angle)
     return angle;
 }
 
-float logicalLEDToNormalizedRadius(uint16_t index)
+inline float logicalLEDToNormalizedRadius(uint16_t index)
 {
     float ratio = (float)index / (float)(NUM_LEDS - 1);
     float radiusMM = FIRST_LED_RADIUS_MM + ratio * (OUTER_RADIUS_MM - FIRST_LED_RADIUS_MM);
@@ -165,12 +169,13 @@ float distanceToSegment(float px, float py, float x1, float y1, float x2, float 
 }
 
 // ============================================================
-// 預先建構十字查表 (Cross Bitmask LUT)
+// 預先建構十字查表 (720 階精細 Bitmask LUT)
 // ============================================================
 
 void buildCrossTable(CrossType type = CROSS_GREEK)
 {
-    constexpr float LINE_WIDTH = 0.065f; // 十字線寬 (約 19.5mm)
+    // 線條寬度設為 0.075 (約 22.5mm)，在高速旋轉掃掠時提供充裕的視覺暫留重疊
+    constexpr float LINE_WIDTH = 0.075f;
 
     // 垂直線段 (Vertical Beam)
     float vX1 = 0.0f, vY1 = -0.85f;
@@ -188,9 +193,10 @@ void buildCrossTable(CrossType type = CROSS_GREEK)
         hX2 =  0.55f;
     }
 
-    // 遍歷 360 個角度，每個角度計算 42 顆 LED 是否點亮並存入 bitmask
-    for (int deg = 0; deg < 360; deg++) {
-        float angle = degToRad((float)deg);
+    // 遍歷 720 個角度切片 (每階 0.5°)，以更密集的角度網格徹底抹平旋轉階梯
+    for (int step = 0; step < NUM_ANGLES; step++) {
+        float deg = (float)step * (360.0f / (float)NUM_ANGLES);
+        float angle = degToRad(deg);
         uint64_t mask = 0;
 
         for (int led = 0; led < NUM_LEDS; led++) {
@@ -206,7 +212,7 @@ void buildCrossTable(CrossType type = CROSS_GREEK)
                 mask |= (1ULL << led);
             }
         }
-        crossBitTable[deg] = mask;
+        crossBitTable[step] = mask;
     }
 }
 
@@ -296,14 +302,19 @@ void updateMotor()
 }
 
 // ============================================================
-// 單葉片快速點陣填充 (Bitmask 查表)
+// 單葉片快速點陣填充 (720 階 0.5° 高精準 Bitmask 查表)
 // ============================================================
 
-inline void renderBlade(CRGB *leds, int angleDeg)
+inline void renderBlade(CRGB *leds, float angleDeg)
 {
-    angleDeg = (angleDeg % 360 + 360) % 360;
+    while (angleDeg < 0.0f)   angleDeg += 360.0f;
+    while (angleDeg >= 360.0f) angleDeg -= 360.0f;
 
-    uint64_t mask = crossBitTable[angleDeg];
+    // 0.5° 精準切片索引 (720 階)
+    int index = (int)(angleDeg * 2.0f + 0.5f);
+    if (index >= NUM_ANGLES) index = 0;
+
+    uint64_t mask = crossBitTable[index];
     const CRGB goldColor(255, 220, 40);
 
     for (int i = 0; i < NUM_LEDS; i++) {
@@ -322,28 +333,30 @@ void renderPOV()
         return;
     }
 
-    // 計算轉速 (RPM 估算)
-    static float lastAngle = 0.0f;
-    static uint32_t lastRevTime = 0;
+    // 四分位即時轉速追蹤 (每 90° 象限快速更新，轉速追蹤頻率提升 4 倍)
+    static int lastQuadrant = -1;
+    static uint32_t lastQuadTime = 0;
+    int currentQuadrant = (int)(rotorAngle / 90.0f); // 0, 1, 2, 3
 
-    // 轉子過零點判定 (順時針跨越 360° -> 0°)
-    if (lastAngle > 270.0f && rotorAngle < 90.0f) {
-        uint32_t now = micros();
-        uint32_t revDelta = now - lastRevTime;
-        lastRevTime = now;
-        if (revDelta > 0) {
-            float instRPM = 60000000.0f / (float)revDelta;
-            // 輕微指數平滑濾波 (Low-pass Filter)
-            currentRPM = currentRPM * 0.8f + instRPM * 0.2f;
-        }
-    } else {
-        // 馬達減速或停止時，避免 RPM 數值卡死
-        if (micros() - lastRevTime > 600000) {
-            currentRPM *= 0.98f;
-            if (currentRPM < 15.0f) currentRPM = 0.0f;
+    if (currentQuadrant != lastQuadrant && lastQuadrant >= 0) {
+        if ((currentQuadrant - lastQuadrant + 4) % 4 == 1) { // 順時針前進 1 個象限
+            uint32_t now = micros();
+            uint32_t quadDelta = now - lastQuadTime;
+            lastQuadTime = now;
+            if (quadDelta > 2000 && quadDelta < 200000) { // 有效範圍 75 ~ 7500 RPM
+                float instRPM = 15000000.0f / (float)quadDelta;
+                currentRPM = currentRPM * 0.7f + instRPM * 0.3f;
+            }
         }
     }
-    lastAngle = rotorAngle;
+    if (lastQuadTime == 0) lastQuadTime = micros();
+    lastQuadrant = currentQuadrant;
+
+    // 馬達減速或停轉時，轉速平滑歸零
+    if (micros() - lastQuadTime > 300000) {
+        currentRPM *= 0.95f;
+        if (currentRPM < 15.0f) currentRPM = 0.0f;
+    }
 
     // 動態超前角補償計算 (Lead-Angle Calculation)
     // 角速度 (度/微秒) = (RPM * 360) / (60 * 1,000,000) = RPM * 0.000006
@@ -366,13 +379,13 @@ void renderPOV()
         lastSpinUpdate = micros();
     }
 
-    // 葉片 2 (Blade 2, 相位 +90° + 超前角補償)
-    int angle2 = (int)(rotorAngle + currentLeadAngle + dynamicSpinAngle + 90.0f + 0.5f) % 360;
+    // 葉片 2 (Blade 2, 相位 +90° + 超前角補償) - 保持 float 浮點高精度
+    float angle2 = rotorAngle + currentLeadAngle + dynamicSpinAngle + 90.0f;
 
-    // 葉片 4 (Blade 4, 相位 +270° + 超前角補償)
-    int angle4 = (int)(rotorAngle + currentLeadAngle + dynamicSpinAngle + 270.0f + 0.5f) % 360;
+    // 葉片 4 (Blade 4, 相位 +270° + 超前角補償 + 雙葉片微相位調校 blade4TrimDeg)
+    float angle4 = rotorAngle + currentLeadAngle + dynamicSpinAngle + 270.0f + blade4TrimDeg;
 
-    // 填充兩葉片顏色 (Bitmask 高速取值)
+    // 填充兩葉片顏色 (720 階 0.5° 精準查表)
     renderBlade(blade2, angle2);
     renderBlade(blade4, angle4);
 
@@ -434,15 +447,27 @@ void processSerialCommands()
                 break;
             }
             case '[': {
-                if (hardwareLatencyUs >= 100.0f) hardwareLatencyUs -= 100.0f;
-                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Current Lead at %.1f RPM: %.2f deg)\n",
-                              hardwareLatencyUs, currentRPM, currentRPM * 0.000006f * hardwareLatencyUs);
+                blade4TrimDeg -= 0.1f;
+                Serial.printf("[TRIM] Blade 4 Phase Trim: %+.2f deg\n", blade4TrimDeg);
                 break;
             }
             case ']': {
+                blade4TrimDeg += 0.1f;
+                Serial.printf("[TRIM] Blade 4 Phase Trim: %+.2f deg\n", blade4TrimDeg);
+                break;
+            }
+            case '<':
+            case ',': {
+                if (hardwareLatencyUs >= 100.0f) hardwareLatencyUs -= 100.0f;
+                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Lead: %.2f deg)\n",
+                              hardwareLatencyUs, currentRPM * 0.000006f * hardwareLatencyUs);
+                break;
+            }
+            case '>':
+            case '.': {
                 hardwareLatencyUs += 100.0f;
-                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Current Lead at %.1f RPM: %.2f deg)\n",
-                              hardwareLatencyUs, currentRPM, currentRPM * 0.000006f * hardwareLatencyUs);
+                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Lead: %.2f deg)\n",
+                              hardwareLatencyUs, currentRPM * 0.000006f * hardwareLatencyUs);
                 break;
             }
             case '+': {
@@ -463,14 +488,14 @@ void processSerialCommands()
             case 'h':
             case 'H': {
                 Serial.println("\n--- [POV LIGHT CONTROL COMMANDS] ---");
-                Serial.println(" 'c'     : Calibrate zero offset (align current angle as 0°)");
-                Serial.println(" 'p'     : Toggle cross type (Greek Cross <-> Latin Cross)");
-                Serial.println(" 'l'     : Toggle lead-angle compensation (ON/OFF)");
-                Serial.println(" '[' / ']': Fine-tune hardware latency (-/+ 100 us)");
-                Serial.println(" 's'     : Toggle dynamic pattern auto-spin");
-                Serial.println(" '+'     : Increase LED brightness");
-                Serial.println(" '-'     : Decrease LED brightness");
-                Serial.println(" '?'     : Show this help menu");
+                Serial.println(" 'c'       : Calibrate zero offset (align current angle as 0°)");
+                Serial.println(" 'p'       : Toggle cross type (Greek Cross <-> Latin Cross)");
+                Serial.println(" '[' / ']' : Micro-trim Blade 4 phase (-/+ 0.1°，消除雙線疊影)");
+                Serial.println(" '<' / '>' : Fine-tune latency compensation (-/+ 100 us)");
+                Serial.println(" 'l'       : Toggle lead-angle compensation (ON/OFF)");
+                Serial.println(" 's'       : Toggle dynamic pattern auto-spin");
+                Serial.println(" '+' / '-' : Adjust LED brightness");
+                Serial.println(" '?'       : Show this help menu");
                 Serial.println("------------------------------------\n");
                 break;
             }
@@ -494,8 +519,8 @@ void updateDiagnostics()
         frameCount = 0;
         lastDiag = now;
 
-        Serial.printf("[DIAG] RPM: %5.1f | FPS: %4u | Lead: %4.1f deg | PWM: %4d us | Armed: %s\n",
-                      currentRPM, fps, currentLeadAngle, currentPWM, motorArmed ? "YES" : "WAIT_ZERO");
+        Serial.printf("[DIAG] RPM: %5.1f | FPS: %4u | Lead: %4.1f deg | Trim4: %+.1f deg | PWM: %4d us | Armed: %s\n",
+                      currentRPM, fps, currentLeadAngle, blade4TrimDeg, currentPWM, motorArmed ? "YES" : "WAIT_ZERO");
     }
 }
 
@@ -516,9 +541,10 @@ void setup()
     analogReadResolution(12);
     pinMode(POT_PIN, INPUT);
 
-    // AS5600 I2C 初始化 (Fast-Mode 400kHz)
+    // AS5600 I2C 初始化 (Fast-Mode 400kHz + 5ms 逾時保護)
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(400000);
+    Wire.setTimeOut(5);
 
     // FastLED RMT 初始化
     FastLED.addLeds<WS2812B, PIN_B2, GRB>(blade2, NUM_LEDS);
@@ -530,10 +556,10 @@ void setup()
     fill_solid(blade4, NUM_LEDS, CRGB::Black);
     FastLED.show();
 
-    // 烘焙十字查表 (Bitmask 結構)
-    Serial.print("Building Cross Bitmask LUT (360x42)... ");
+    // 烘焙 720 階精細十字查表 (Bitmask 結構)
+    Serial.print("Building 720-Step Cross Bitmask LUT (5,760 Bytes)... ");
     buildCrossTable(currentCrossType);
-    Serial.println("Done! (2,880 Bytes)");
+    Serial.println("Done!");
 
     // 馬達與電變初始化
     spark.setPeriodHertz(50);
