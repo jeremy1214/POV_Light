@@ -1,6 +1,6 @@
 # ESP32-C3 POV 旋轉視覺暫留顯示系統 (POV Light)
 
-一套基於 **Seeed Studio XIAO ESP32-C3** 的高效能**旋轉視覺暫留 (POV, Persistence of Vision)** 顯示與馬達控制系統。透過雙旋轉葉片搭載的 WS2812B 可定址 LED，結合 AS5600 磁性旋轉編碼器之閉迴路角度追蹤，在高速旋轉中於半空中精確投影出金色幾何圖騰——**六芒星 (Hexagram / 大衛之星)**。
+一套基於 **Seeed Studio XIAO ESP32-C3** 的高效能**旋轉視覺暫留 (POV, Persistence of Vision)** 顯示與馬達控制系統。透過雙旋轉葉片搭載的 WS2812B 可定址 LED，結合 AS5600 磁性旋轉編碼器之閉迴路角度追蹤，在高速旋轉中於半空中精確投影出金色幾何圖騰——**十字 (Cross / 正十字與拉丁十字架)**。
 
 ---
 
@@ -70,15 +70,22 @@ POV_Light/
 * **改進實作**：以 `millis()` 將馬達與 ADC 更新限制在 **$50\text{Hz}$ ($20\text{ms}$)**，與電變 PWM 訊號週期完美同步，把 CPU 運算資源完全釋放給 POV 迴圈。
 
 ### 3. 💾 64-bit Bitmask LUT 記憶體壓縮 (節省 81% SRAM)
-* **原始結構**：`bool hexagramTable[360][42]` 佔用 $360 \times 42 = 15,120\text{ bytes}$ ($\approx 14.8\text{ KB}$)。
-* **改進實作**：改用 `uint64_t hexagramBitTable[360]`，將單一角度下 42 顆 LED 的開關狀態壓縮至 64 位元整數中，僅消耗 **$2,880\text{ bytes}$** ($\approx 2.8\text{ KB}$)。
+* **架構優化**：十字圖案查表採用 `uint64_t crossBitTable[360]`，將單一角度下 42 顆 LED 的開關狀態壓縮至 64 位元整數中，僅消耗 **$2,880\text{ bytes}$** ($\approx 2.8\text{ KB}$)。
 * **效益**：記憶體佔用大幅縮減 **$81\%$**，並利用單週期位元遮罩 `((mask >> i) & 1ULL)` 取值，顯著提升 CPU 快取命中率與取值速度。
 
-### 4. 📊 即時轉速 (RPM) 與 FPS 效能診斷
+### 4. 📐 動態超前角補償 (Lead-Angle Latency Compensation)
+* **物理瓶頸**：WS2812B 傳輸 42 顆 LED 需耗時約 $1.26\text{ms}$，加上 I2C 讀取與計算總延遲約 $1.4\text{ms}$。在 600 RPM 下，葉片在發光前已轉動超過 $4.5^\circ$！若無補償，圖案會隨轉速變化產生扇形扭曲與方位漂移。
+* **改進實作**：
+  * 引入動態補償公式：
+    $$\Delta \theta_{\text{lead}} = \frac{\text{RPM} \times 360^\circ}{60 \times 10^6\,\mu s} \times t_{\text{latency}} \approx \text{RPM} \times 0.000006 \times t_{\text{latency\_us}}$$
+  * 預設延遲設為 $1400\,\mu s$ ($1.4\text{ms}$)，隨轉速即時動態前推投影角度，徹底抵消硬體通訊傳輸延遲。
+  * 支援 Serial 即時互動調校（按 `l` 開關對比、按 `[`/`]` 微調延遲微秒數）。
+
+### 5. 📊 即時轉速 (RPM) 與 FPS 效能診斷
 * **新增功能**：監聽 AS5600 角度順時針跨越過零點（$360^\circ \to 0^\circ$）之微秒時間差，計算當前即時轉速並以指數移動平均 (EMA) 平滑濾波。
 * **序列埠監控**：每秒自動輸出格式化診斷資訊：
   ```
-  [DIAG] RPM:  580.4 | FPS:  648 | Throttle PWM: 1680 us | Armed: YES
+  [DIAG] RPM:  580.4 | FPS:  648 | Lead:  4.9 deg | Throttle PWM: 1680 us | Armed: YES
   ```
 
 ---
@@ -123,4 +130,17 @@ build_src_filter = +<main.cpp>
    ```
    [MOTOR] Arming Success: Motor Unlocked.
    ```
-4. 此時調速功能已解鎖，順時針旋轉旋鈕即可平滑提高轉速，半空中將穩定呈現金色六芒星。
+4. 此時調速功能已解鎖，順時針旋轉旋鈕即可平滑提高轉速，半空中將穩定呈現金色十字幾何圖案。
+
+### 3. 序列埠即時互動指令 (Serial Commands)
+在 Serial Monitor (115200) 中可輸入以下字元進行即時調校：
+
+| 指令 | 說明 |
+| :---: | :--- |
+| `c` | **一鍵零點校準**：將當前角度記錄為 0° 基準點並輸出常數 |
+| `p` | **切換十字樣式**：在「正十字 (Greek Cross)」與「經典拉丁十字架 (Latin Cross)」之間即時切換 |
+| `l` | **開關超前角補償**：即時切換超前角延遲補償（可立即觀察圖案平順度對比） |
+| `[` / `]` | **微調延遲時間**：以 $\pm 100\,\mu s$ 遞增/遞減硬體延遲補償值 |
+| `s` | **動態自轉動畫**：開啟/關閉圖案每秒 $20^\circ$ 懸空慢速自轉 |
+| `+` / `-` | **增減亮度**：以階梯調整 LED 輸出強度 |
+| `?` | **顯示說明選單** |

@@ -52,6 +52,18 @@ constexpr float SPIN_SPEED_DPS = 20.0f; // 動態自轉速度 (度/秒)
 uint8_t currentBrightness = BRIGHTNESS;
 
 // ============================================================
+// 超前角延遲補償 (Lead-Angle Compensation)
+//
+// 物理原理：從 AS5600 角度取樣到 WS2812B (42 顆) 訊號發送完成並鎖存發光，
+// 硬體耗時約 1.35 ~ 1.45 ms。
+// 在旋轉過程中，葉片在發光前已向前轉動了 leadAngle 度。
+// 補償公式：leadAngle = (RPM * 360 / 60) * (latencyUs / 1,000,000)
+// ============================================================
+bool leadCompEnabled = true;
+float hardwareLatencyUs = 1400.0f; // 預設硬體總延遲 1400 微秒 (1.4ms)
+float currentLeadAngle = 0.0f;     // 當前計算之超前角補償量 (度)
+
+// ============================================================
 // 馬達安全控制 (Safety Motor Controller)
 // ============================================================
 
@@ -79,13 +91,21 @@ constexpr float OUTER_RADIUS_MM     = 300.0f;
 constexpr float FIRST_LED_RADIUS_MM = 12.5f;
 
 // ============================================================
-// 六芒星查表 (Bitmask LUT: 360 角度 × uint64_t)
+// 十字圖案查表 (Cross Bitmask LUT: 360 角度 × uint64_t)
 //
-// 優化重點：將原本 bool[360][42] 的 15,120 bytes
-// 壓縮為 uint64_t[360] 的 2,880 bytes，節省 81% SRAM 空間並提高快取命中率
+// 支援兩種經典十字樣式：
+// 1. CROSS_GREEK : 正十字 (四臂等長對稱，交叉於圓心)
+// 2. CROSS_LATIN : 拉丁十字架 (橫樑偏上方，經典十字架)
 // ============================================================
 
-uint64_t hexagramBitTable[360];
+enum CrossType {
+    CROSS_GREEK = 0, // 正十字
+    CROSS_LATIN = 1  // 拉丁十字架
+};
+
+CrossType currentCrossType = CROSS_GREEK; // 預設正十字
+
+uint64_t crossBitTable[360];
 
 // ============================================================
 // 系統運作診斷數據
@@ -145,30 +165,27 @@ float distanceToSegment(float px, float py, float x1, float y1, float x2, float 
 }
 
 // ============================================================
-// 預先建構六芒星查表 (開機單次執行)
+// 預先建構十字查表 (Cross Bitmask LUT)
 // ============================================================
 
-void buildHexagramTable()
+void buildCrossTable(CrossType type = CROSS_GREEK)
 {
-    constexpr float OUTER_R    = 0.86f;
-    constexpr float LINE_WIDTH = 0.055f;
+    constexpr float LINE_WIDTH = 0.065f; // 十字線寬 (約 19.5mm)
 
-    float upX[3], upY[3];
-    float dnX[3], dnY[3];
+    // 垂直線段 (Vertical Beam)
+    float vX1 = 0.0f, vY1 = -0.85f;
+    float vX2 = 0.0f, vY2 =  0.85f;
 
-    // 上三角形頂點 (0°, 120°, 240°)
-    const float upAngles[3] = { 0.0f, 120.0f, 240.0f };
-    // 下三角形頂點 (180°, 300°, 60°)
-    const float dnAngles[3] = { 180.0f, 300.0f, 60.0f };
+    // 水平線段 (Horizontal Beam)
+    float hX1 = -0.85f, hY1 = 0.0f;
+    float hX2 =  0.85f, hY2 = 0.0f;
 
-    for (int i = 0; i < 3; i++) {
-        float a = degToRad(upAngles[i]);
-        upX[i] = OUTER_R * sinf(a);
-        upY[i] = OUTER_R * cosf(a);
-
-        float b = degToRad(dnAngles[i]);
-        dnX[i] = OUTER_R * sinf(b);
-        dnY[i] = OUTER_R * cosf(b);
+    if (type == CROSS_LATIN) {
+        // 拉丁十字架樣式：橫樑偏上方 (y = 0.25)，橫臂稍短 (長度 0.55)
+        hY1 = 0.25f;
+        hY2 = 0.25f;
+        hX1 = -0.55f;
+        hX2 =  0.55f;
     }
 
     // 遍歷 360 個角度，每個角度計算 42 顆 LED 是否點亮並存入 bitmask
@@ -180,33 +197,16 @@ void buildHexagramTable()
             float radius = logicalLEDToNormalizedRadius(led);
             float x = radius * sinf(angle);
             float y = radius * cosf(angle);
-            bool on = false;
 
-            // 檢查是否落在上三角形三邊
-            for (int edge = 0; edge < 3; edge++) {
-                int next = (edge + 1) % 3;
-                if (distanceToSegment(x, y, upX[edge], upY[edge], upX[next], upY[next]) < LINE_WIDTH) {
-                    on = true;
-                    break;
-                }
-            }
+            // 判斷點 (x, y) 到垂直與水平兩條線段的最短距離
+            float dVertical   = distanceToSegment(x, y, vX1, vY1, vX2, vY2);
+            float dHorizontal = distanceToSegment(x, y, hX1, hY1, hX2, hY2);
 
-            // 檢查是否落在下三角形三邊
-            if (!on) {
-                for (int edge = 0; edge < 3; edge++) {
-                    int next = (edge + 1) % 3;
-                    if (distanceToSegment(x, y, dnX[edge], dnY[edge], dnX[next], dnY[next]) < LINE_WIDTH) {
-                        on = true;
-                        break;
-                    }
-                }
-            }
-
-            if (on) {
+            if (dVertical < LINE_WIDTH || dHorizontal < LINE_WIDTH) {
                 mask |= (1ULL << led);
             }
         }
-        hexagramBitTable[deg] = mask;
+        crossBitTable[deg] = mask;
     }
 }
 
@@ -303,7 +303,7 @@ inline void renderBlade(CRGB *leds, int angleDeg)
 {
     angleDeg = (angleDeg % 360 + 360) % 360;
 
-    uint64_t mask = hexagramBitTable[angleDeg];
+    uint64_t mask = crossBitTable[angleDeg];
     const CRGB goldColor(255, 220, 40);
 
     for (int i = 0; i < NUM_LEDS; i++) {
@@ -336,8 +336,22 @@ void renderPOV()
             // 輕微指數平滑濾波 (Low-pass Filter)
             currentRPM = currentRPM * 0.8f + instRPM * 0.2f;
         }
+    } else {
+        // 馬達減速或停止時，避免 RPM 數值卡死
+        if (micros() - lastRevTime > 600000) {
+            currentRPM *= 0.98f;
+            if (currentRPM < 15.0f) currentRPM = 0.0f;
+        }
     }
     lastAngle = rotorAngle;
+
+    // 動態超前角補償計算 (Lead-Angle Calculation)
+    // 角速度 (度/微秒) = (RPM * 360) / (60 * 1,000,000) = RPM * 0.000006
+    if (leadCompEnabled && currentRPM > 20.0f) {
+        currentLeadAngle = currentRPM * 0.000006f * hardwareLatencyUs;
+    } else {
+        currentLeadAngle = 0.0f;
+    }
 
     // 動態圖案自轉 (Dynamic Spin)
     static uint32_t lastSpinUpdate = 0;
@@ -352,11 +366,11 @@ void renderPOV()
         lastSpinUpdate = micros();
     }
 
-    // 葉片 2 (Blade 2, 相位 +90°)
-    int angle2 = (int)(rotorAngle + dynamicSpinAngle + 90.0f + 0.5f) % 360;
+    // 葉片 2 (Blade 2, 相位 +90° + 超前角補償)
+    int angle2 = (int)(rotorAngle + currentLeadAngle + dynamicSpinAngle + 90.0f + 0.5f) % 360;
 
-    // 葉片 4 (Blade 4, 相位 +270°)
-    int angle4 = (int)(rotorAngle + dynamicSpinAngle + 270.0f + 0.5f) % 360;
+    // 葉片 4 (Blade 4, 相位 +270° + 超前角補償)
+    int angle4 = (int)(rotorAngle + currentLeadAngle + dynamicSpinAngle + 270.0f + 0.5f) % 360;
 
     // 填充兩葉片顏色 (Bitmask 高速取值)
     renderBlade(blade2, angle2);
@@ -397,11 +411,38 @@ void processSerialCommands()
                 }
                 break;
             }
+            case 'p':
+            case 'P': {
+                currentCrossType = (currentCrossType == CROSS_GREEK) ? CROSS_LATIN : CROSS_GREEK;
+                buildCrossTable(currentCrossType);
+                Serial.printf("[PATTERN] Cross pattern switched to: %s\n",
+                              (currentCrossType == CROSS_GREEK) ? "GREEK CROSS (正十字)" : "LATIN CROSS (拉丁十字架)");
+                break;
+            }
             case 's':
             case 'S': {
                 autoSpinEnabled = !autoSpinEnabled;
                 Serial.printf("[EFFECT] Auto-spin %s (Speed: %.1f deg/s)\n",
                               autoSpinEnabled ? "ENABLED" : "DISABLED", SPIN_SPEED_DPS);
+                break;
+            }
+            case 'l':
+            case 'L': {
+                leadCompEnabled = !leadCompEnabled;
+                Serial.printf("[LEAD-COMP] Lead-Angle Compensation: %s (Latency: %.0f us, Current Lead: %.2f deg)\n",
+                              leadCompEnabled ? "ENABLED" : "DISABLED", hardwareLatencyUs, currentLeadAngle);
+                break;
+            }
+            case '[': {
+                if (hardwareLatencyUs >= 100.0f) hardwareLatencyUs -= 100.0f;
+                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Current Lead at %.1f RPM: %.2f deg)\n",
+                              hardwareLatencyUs, currentRPM, currentRPM * 0.000006f * hardwareLatencyUs);
+                break;
+            }
+            case ']': {
+                hardwareLatencyUs += 100.0f;
+                Serial.printf("[LEAD-COMP] Latency set to: %.0f us (Current Lead at %.1f RPM: %.2f deg)\n",
+                              hardwareLatencyUs, currentRPM, currentRPM * 0.000006f * hardwareLatencyUs);
                 break;
             }
             case '+': {
@@ -422,11 +463,14 @@ void processSerialCommands()
             case 'h':
             case 'H': {
                 Serial.println("\n--- [POV LIGHT CONTROL COMMANDS] ---");
-                Serial.println(" 'c' : Calibrate zero offset (align current angle as 0°)");
-                Serial.println(" 's' : Toggle dynamic pattern auto-spin");
-                Serial.println(" '+' : Increase LED brightness");
-                Serial.println(" '-' : Decrease LED brightness");
-                Serial.println(" '?' : Show this help menu");
+                Serial.println(" 'c'     : Calibrate zero offset (align current angle as 0°)");
+                Serial.println(" 'p'     : Toggle cross type (Greek Cross <-> Latin Cross)");
+                Serial.println(" 'l'     : Toggle lead-angle compensation (ON/OFF)");
+                Serial.println(" '[' / ']': Fine-tune hardware latency (-/+ 100 us)");
+                Serial.println(" 's'     : Toggle dynamic pattern auto-spin");
+                Serial.println(" '+'     : Increase LED brightness");
+                Serial.println(" '-'     : Decrease LED brightness");
+                Serial.println(" '?'     : Show this help menu");
                 Serial.println("------------------------------------\n");
                 break;
             }
@@ -450,8 +494,8 @@ void updateDiagnostics()
         frameCount = 0;
         lastDiag = now;
 
-        Serial.printf("[DIAG] RPM: %5.1f | FPS: %4u | Throttle PWM: %4d us | Armed: %s\n",
-                      currentRPM, fps, currentPWM, motorArmed ? "YES" : "WAIT_ZERO");
+        Serial.printf("[DIAG] RPM: %5.1f | FPS: %4u | Lead: %4.1f deg | PWM: %4d us | Armed: %s\n",
+                      currentRPM, fps, currentLeadAngle, currentPWM, motorArmed ? "YES" : "WAIT_ZERO");
     }
 }
 
@@ -465,7 +509,7 @@ void setup()
     delay(500);
 
     Serial.println("\n==========================================");
-    Serial.println("  ESP32-C3 POV HEXAGRAM DISPLAY (MAIN)");
+    Serial.println("    ESP32-C3 POV CROSS DISPLAY (MAIN)");
     Serial.println("==========================================");
 
     // ADC 設置
@@ -486,9 +530,9 @@ void setup()
     fill_solid(blade4, NUM_LEDS, CRGB::Black);
     FastLED.show();
 
-    // 烘焙六芒星查表 (Bitmask 結構)
-    Serial.print("Building Hexagram Bitmask LUT (360x42)... ");
-    buildHexagramTable();
+    // 烘焙十字查表 (Bitmask 結構)
+    Serial.print("Building Cross Bitmask LUT (360x42)... ");
+    buildCrossTable(currentCrossType);
     Serial.println("Done! (2,880 Bytes)");
 
     // 馬達與電變初始化
